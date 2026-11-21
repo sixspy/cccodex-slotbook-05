@@ -1,6 +1,7 @@
 """档期锁与争用登记。"""
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
@@ -17,24 +18,36 @@ class LockIn(BaseModel):
 
 
 def try_acquire(conn, lock_key: str, holder: str) -> bool:
+    """抢档锁：零等待 INSERT 即抢锁，抢到立即落库可见、排他持有。
+
+    锁不认同人：同人第二请求与异账号同等待遇。INSERT 撞锁（锁行已在或
+    他人写事务进行中）即败，只留争用痕；争用痕当场落库，不随后续业务
+    回滚。抢锁 INSERT 零等待；落库 commit 恢复正常等待，不被瞬时读锁
+    误伤（否则赢家 commit 会被后到者的读快照顶掉，双方便宜都抢不到）。
+    """
     now = datetime.now().isoformat(timespec="seconds")
-    row = conn.execute(
-        "SELECT holder FROM slot_locks WHERE lock_key=?", (lock_key,)
-    ).fetchone()
-    if row is None:
+    conn.execute("PRAGMA busy_timeout=0")
+    try:
         conn.execute(
             "INSERT INTO slot_locks(lock_key,holder,acquired_at) VALUES (?,?,?)",
             (lock_key, holder, now),
         )
-        return True
-    if row["holder"] == holder:
-        return True
-    conn.execute(
-        """INSERT INTO contention_log(lock_key,actor,action,detail,created_at)
-           VALUES (?,?,?,?,?)""",
-        (lock_key, holder, "争用", f"持有者={row['holder']}", now),
-    )
-    return False
+    except sqlite3.Error:
+        conn.rollback()  # 未抢到：锁行已落库或他人写事务进行中
+        conn.execute("PRAGMA busy_timeout=30000")
+        row = conn.execute(
+            "SELECT holder FROM slot_locks WHERE lock_key=?", (lock_key,)
+        ).fetchone()
+        conn.execute(
+            """INSERT INTO contention_log(lock_key,actor,action,detail,created_at)
+               VALUES (?,?,?,?,?)""",
+            (lock_key, holder, "争用", f"持有者={row['holder'] if row else '未知'}", now),
+        )
+        conn.commit()  # 争用痕落库，不随后续业务回滚
+        return False
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.commit()  # 锁行立即落库可见，排他持有至 release
+    return True
 
 
 def release(conn, lock_key: str, holder: str) -> None:
